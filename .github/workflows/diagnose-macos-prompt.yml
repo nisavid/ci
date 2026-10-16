@@ -1,0 +1,259 @@
+name: Diagnose macOS prompt matching
+
+on:
+  push:
+    branches:
+      - nisavid/diagnose-macos-prompt-matching
+
+permissions: {}
+
+jobs:
+  replay:
+    runs-on: macos-15-intel
+    timeout-minutes: 3
+    steps:
+      - name: Replay fixed prompt bytes with native grep
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v python3 >/dev/null 2>&1; then
+            printf '%s\n' '{"kind":"fatal","reason":"python3 unavailable"}' \
+              '{"kind":"cleanup","created":false,"ok":true}'
+            exit 1
+          fi
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import selectors
+          import shutil
+          import signal
+          import stat
+          import subprocess
+          import tempfile
+          import time
+
+          deadline = time.monotonic() + 90
+          failures = []
+          root = None
+          cleanup_ok = False
+          outcomes = {}
+          marker = b"__UPSTREAM_SMOKE_PROMPT__"
+
+          def emit(kind, **values):
+              print(json.dumps({"kind": kind, **values}, ensure_ascii=True), flush=True)
+
+          def expired(signum, frame):
+              raise TimeoutError("diagnostic deadline")
+
+          signal.signal(signal.SIGALRM, expired)
+          signal.setitimer(signal.ITIMER_REAL, 90)
+
+          def run(argv, env):
+              end = min(deadline - 3, time.monotonic() + 1.9)
+              if time.monotonic() >= end:
+                  raise TimeoutError("diagnostic deadline reserve")
+              proc = subprocess.Popen(
+                  argv, env=env, stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  start_new_session=True,
+              )
+              streams = selectors.DefaultSelector()
+              buffers = {"stdout": bytearray(), "stderr": bytearray()}
+              problem = None
+              status = None
+              try:
+                  for name, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+                      os.set_blocking(pipe.fileno(), False)
+                      streams.register(pipe, selectors.EVENT_READ, name)
+                  while streams.get_map() and problem is None:
+                      left = end - time.monotonic()
+                      if left <= 0:
+                          problem = "timeout"
+                          break
+                      for key, events in streams.select(min(left, 0.05)):
+                          chunk = os.read(key.fd, 4096)
+                          if not chunk:
+                              streams.unregister(key.fileobj)
+                              continue
+                          buf = buffers[key.data]
+                          available = 65536 - len(buf)
+                          buf.extend(chunk[:available])
+                          if len(chunk) > available:
+                              problem = "output_limit"
+                              break
+                  if problem is None:
+                      try:
+                          status = proc.wait(timeout=max(0.001, end - time.monotonic()))
+                      except subprocess.TimeoutExpired:
+                          problem = "timeout"
+              finally:
+                  if problem is not None or proc.poll() is None:
+                      try:
+                          os.killpg(proc.pid, signal.SIGKILL)
+                      except ProcessLookupError:
+                          pass
+                  try:
+                      status = proc.wait(timeout=0.1)
+                  except subprocess.TimeoutExpired:
+                      problem = "reap_timeout"
+                  streams.close()
+                  proc.stdout.close()
+                  proc.stderr.close()
+              out, err = bytes(buffers["stdout"]), bytes(buffers["stderr"])
+              record = {
+                  "status": status, "collection_error": problem,
+                  "stdout_bytes": len(out),
+                  "stdout_sha256": hashlib.sha256(out).hexdigest(),
+                  "stderr_bytes": len(err),
+                  "stderr_excerpt": err[:2048].decode("utf-8", "backslashreplace"),
+                  "stderr_truncated": len(err) > 2048,
+              }
+              if problem:
+                  failures.append(problem)
+              return record, out
+
+          def metadata(label, argv, env, show_output=True):
+              record, out = run(argv, env)
+              if show_output:
+                  record["stdout_excerpt"] = out[:2048].decode("utf-8", "backslashreplace")
+                  record["stdout_truncated"] = len(out) > 2048
+              emit("metadata", item=label, **record)
+              if record["status"] != 0 or record["collection_error"]:
+                  failures.append("metadata unavailable: " + label)
+              return record, out
+
+          try:
+              env = os.environ.copy()
+              grep = shutil.which("grep")
+              locale = shutil.which("locale")
+              if not grep or not locale:
+                  raise RuntimeError("grep or locale unavailable on inherited PATH")
+              real_grep = os.path.realpath(grep)
+              identity = os.stat(real_grep)
+              if not stat.S_ISREG(identity.st_mode):
+                  raise RuntimeError("selected grep is not a regular executable")
+              digest = hashlib.sha256()
+              with open(real_grep, "rb") as binary:
+                  while True:
+                      chunk = binary.read(65536)
+                      if not chunk:
+                          break
+                      digest.update(chunk)
+              emit("grep_identity", selected_path=grep, resolved_path=real_grep,
+                   file_bytes=identity.st_size, sha256=digest.hexdigest())
+              metadata("os_release_arch", ["/usr/bin/uname", "-srm"], env)
+              metadata("os_version", ["/usr/bin/sw_vers", "-productVersion"], env)
+              metadata("os_build", ["/usr/bin/sw_vers", "-buildVersion"], env)
+              metadata("grep_version", [grep, "--version"], env)
+              inventory, available = metadata("installed_locale_inventory",
+                                              [locale, "-a"], env, False)
+              inherited = env.get("LC_ALL") or env.get("LC_CTYPE") or env.get("LANG") or "C"
+
+              def locale_key(value):
+                  return value.lower().replace("-", "").replace("_", "")
+
+              conditions = [("inherited", env), ("C", {**env, "LC_ALL": "C"})]
+              selected = None
+              if inventory["status"] == 0 and not inventory["collection_error"]:
+                  names = available.decode("ascii").splitlines()
+                  candidates = [
+                      name for name in names
+                      if ("utf8" in locale_key(name)
+                          and locale_key(name) != locale_key(inherited))
+                  ]
+                  candidates.sort(key=lambda name: (name != "en_US.UTF-8", name))
+                  if candidates:
+                      selected = candidates[0]
+                      conditions.append(("installed_utf8", {**env, "LC_ALL": selected}))
+              emit("locale_selection", inherited_ctype_selection=inherited,
+                   installed_utf8_selection=selected, conditions=len(conditions))
+
+              data = base64.b64decode(
+                  "G1AkZnsiaG9vayI6ICJTb3VyY2VkUmNGaWxlRm9yV2FycCIsICJ2YWx1ZSI6IHsgInNoZWxsIjogInpzaCIsICJ1bmFtZSI6ICJEYXJ3aW4iIH19nCUgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICANIA0NX19VUFNUUkVBTV9TTU9LRV9QUk9NUFRfXxtbPzIwMDRoDQ1fX1VQU1RSRUFNX1NNT0tFX1BST01QVF9fDQ1fX1VQU1RSRUFNX1NNT0tFX1BST01QVF9fDQ1fX1VQU1RSRUFNX1NNT0tFX1BST01QVF9fDQ1fX1VQU1RSRUFNX1NNT0tFX1BST01QVF9fDQ1fX1VQU1RSRUFNX1NNT0tFX1BST01QVF9fDQ1fX1VQU1RSRUFNX1NNT0tFX1BST01QVF9f",
+                  validate=True,
+              )
+              if (len(data) != 363 or data.count(marker) != 7 or data.endswith(b"\n")
+                      or hashlib.sha256(data).hexdigest()
+                      != "0221556bebf29076da10ef64819e2c96abd5e55308fbf726a140be9f522c06ef"):
+                  raise RuntimeError("embedded fixture pin mismatch")
+              try:
+                  data.decode("utf-8")
+              except UnicodeDecodeError:
+                  pass
+              else:
+                  raise RuntimeError("fixture unexpectedly valid UTF-8")
+              inputs = {
+                  "tail": data, "tail_plus_lf": data + b"\n",
+                  "ascii_without_lf": marker, "ascii_with_lf": marker + b"\n",
+                  "absent": b"absent marker\n",
+              }
+              root = tempfile.mkdtemp(prefix="grep-")
+              paths = {}
+              for name, content in inputs.items():
+                  path = os.path.join(root, name)
+                  with open(path, "xb") as fixture:
+                      fixture.write(content)
+                  paths[name] = path
+                  emit("input", name=name, bytes=len(content),
+                       sha256=hashlib.sha256(content).hexdigest())
+
+              for condition, condition_env in conditions:
+                  emit("locale", condition=condition, selected_values={
+                      key: condition_env.get(key) for key in ("LANG", "LC_ALL", "LC_CTYPE")
+                  })
+                  metadata("charmap:" + condition, [locale, "charmap"], condition_env)
+                  outcomes[condition] = {}
+                  controls_ok = True
+                  for name, path in paths.items():
+                      quiet, quiet_out = run(
+                          [grep, "-Fq", "--", marker.decode("ascii"), path], condition_env)
+                      matches, match_out = run(
+                          [grep, "-Fo", "--", marker.decode("ascii"), path], condition_env)
+                      count = match_out.count(marker)
+                      emit("grep", condition=condition, input=name,
+                           quiet=quiet, occurrences=matches, marker_occurrences=count)
+                      outcomes[condition][name] = (quiet["status"], matches["status"], count)
+                      if name in ("ascii_without_lf", "ascii_with_lf", "absent"):
+                          positive = name != "absent"
+                          expected_status = 0 if positive else 1
+                          expected_out = marker + b"\n" if positive else b""
+                          ok = (
+                              quiet["status"] == matches["status"] == expected_status
+                              and quiet["collection_error"] is None
+                              and matches["collection_error"] is None
+                              and quiet_out == b"" and match_out == expected_out
+                          )
+                          controls_ok = controls_ok and ok
+                  emit("controls", condition=condition, ok=controls_ok)
+                  if not controls_ok:
+                      failures.append("broken controls: " + condition)
+              contrasts = {}
+              for name in ("tail", "tail_plus_lf"):
+                  measurements = [items[name] for items in outcomes.values()]
+                  contrasts[name] = len(set(measurements)) > 1
+              emit("observation", locale_sensitive_matching=contrasts,
+                   historical_root_cause="not determined")
+          except Exception as exc:
+              failures.append(type(exc).__name__)
+              emit("fatal", error_type=type(exc).__name__, reason=str(exc))
+          finally:
+              try:
+                  if root is not None:
+                      shutil.rmtree(root)
+                      cleanup_ok = not os.path.lexists(root)
+                  else:
+                      cleanup_ok = True
+                  emit("cleanup", created=root is not None, ok=cleanup_ok)
+              except Exception as exc:
+                  failures.append("cleanup failure")
+                  emit("cleanup", created=root is not None, ok=False,
+                       error_type=type(exc).__name__, reason=str(exc))
+              if not cleanup_ok:
+                  failures.append("cleanup failure")
+              emit("result", result="inconclusive" if failures else "observations recorded",
+                   failures=failures)
+              signal.setitimer(signal.ITIMER_REAL, 0)
+          raise SystemExit(1 if failures else 0)
+          PY
