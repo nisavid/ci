@@ -15,7 +15,7 @@ Use the canonical `needs-triage`, `needs-info`, `ready-for-agent`,
 
 ### Domain docs
 
-This is a single-context repository with a root `CONTEXT.md` (the CI
+This is a single-context repository with a root `GLOSSARY.md` (the CI
 vocabulary) and system-wide ADRs under `docs/adr/`, both created when domain
 modeling first needs them. Neither exists yet. See `docs/agents/domain.md`.
 
