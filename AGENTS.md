@@ -37,3 +37,7 @@ enforces them through the `commit-msg` and `pre-push` hooks that
 - Prefer verified repository facts over guesses or aspirational guidance.
 - When adding new agent-facing instructions, ask whether the information is durable, non-obvious, and useful before scouting a task.
 - Remove guidance that becomes redundant with ordinary file discovery.
+
+## Private role reentry
+
+If you hold an existing Codex Director, Dispatch, or Sage appointment for this repository, resolve its private role entry on reentry and before covered work. In this repository, read the matching absolute path using `git config --local --get` with `ci-codex.directorEntry`, `ci-codex.dispatchEntry`, or `ci-codex.sageEntry`. Resolve relative references from the private entry's directory. Follow its role and admission references and recover current holds. If the pointer or recipient binding is missing or mismatched, preserve the actual assignment and return the specific missing binding to the entry owner before an affected start. Workers and other recipients follow their actual assignment and admission route. A pointer supplies instructions for an existing appointment; it does not create one.
