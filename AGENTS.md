@@ -5,7 +5,7 @@
 ### Issue tracker
 
 Issues, PRDs, and Wayfinder maps are tracked in GitHub Issues for
-`nisavid/ci`. See `docs/agents/issue-tracker.md`.
+`nisavid/pipelines`. See `docs/agents/issue-tracker.md`.
 
 ### Triage labels
 

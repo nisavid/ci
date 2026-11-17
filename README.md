@@ -1,10 +1,7 @@
-# ci
+# Pipelines
 
-Home of the CI topic orchestrator for Ivan's repositories. It owns CI development, operations, issues and improvements across those repositories, and it answers to the Claude Foreman.
+Shared home for pipeline planning and building blocks across the software we maintain. Software Integration and Software Delivery participate as peers, with their existing responsibilities and custody intact.
 
-This repository will hold:
-
-- the orchestrator's charter, cross-repository CI map, tickets, decision records and CI vocabulary;
-- shared CI building blocks, such as reusable GitHub Actions workflows and composite actions, Buildkite pipeline templates, agent images, and pipeline settings kept as code.
+The repository tracks the shared planning work, decisions, and CI vocabulary. It can hold reusable workflow and pipeline components for the providers in use. CI remains a workflow and search alias for Software Integration; continuous integration is its current operating method.
 
 The CI-provider evaluation lives in a separate, time-boxed repository, `ci-evals`, in the nisavid-io organization.
